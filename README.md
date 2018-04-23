@@ -2,8 +2,19 @@
 Repository for the Domain Adaptation work using the self-ensembling
 (mean teacher) for the domain adaptation of MRI images.
 
+## Installing requirements
+Requirements for this project:
+
+    * (required) Python 3.6 (use a virtual environment);
+    * (required) [SCT](https://github.com/neuropoly/spinalcordtoolbox)
+    * (optional) FSLeyes/FSLview/FSLutils
+
+These requirements are not included in the `setup.py` requirements, since
+they aren't *pip-installable*, so you need to install them before
+installing the project.
+
 ## Documentation
-To build documentation, create. Python 3.6 environment and then do:
+All the documentatio is in Sphinx. First, create a Python 3.6 environment and then do:
 
 ```
 ~# git clone https://github.com/neuropoly/domainadaptation.git
