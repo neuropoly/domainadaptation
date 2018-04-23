@@ -17,6 +17,7 @@ import medicaltorch.metrics as metrics
 import medicaltorch.transforms as mt_transform
 
 import torchvision as tv
+import torchvision.utils as vutils
 
 from tqdm import *
 from tensorboardX import SummaryWriter
@@ -280,6 +281,31 @@ def cmd_train(ctx):
         tqdm.write("Class Loss: {:.6f}".format(task_loss_avg))
         tqdm.write("Consistency Loss: {:.6f}".format(consistency_loss_avg))
 
+        # Write sample images
+        if ctx["write_images"] and epoch % ctx["write_images_interval"] == 0:
+            try:
+                plot_img = vutils.make_grid(student_source_out.data,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Model Source Prediction', plot_img, epoch)
+                plot_img = vutils.make_grid(s_var_image.data,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Model Source Input', plot_img, epoch)
+                plot_img = vutils.make_grid(student_target_out.data,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Model Target Prediction', plot_img, epoch)
+                plot_img = vutils.make_grid(t_var_image.data,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Model Target Input', plot_img, epoch)
+
+
+            except:
+                tqdm.write("*** Error writing images ***")
+
+        writer.add_scalars('losses', {'composite_loss': loss_avg,
+                           'class_loss': task_loss_avg,
+                           'consistency_loss': consistency_loss_avg},
+                           epoch)
+
         # Evaluation ####################################################################
 
         # Evaluation mode
@@ -366,12 +392,14 @@ def cmd_train(ctx):
                 tqdm.write("Ema Val Loss:  {:.6f}".format(ema_val_loss_avg))
                 writer.add_scalars('metrics', val_ema_result_dict, epoch)
 
-            writer.add_scalars('losses', {'val_loss': val_loss_avg,
-                                          'ema_val_loss': ema_val_loss_avg,
-                                          'composite_loss': loss_avg,
-                                          'class_loss': task_loss_avg,
-                                          'consistency_loss': consistency_loss_avg},
-                                          epoch)
+            if loader == source_val_loader:
+                writer.add_scalars('losses', {'val_loss_source': val_loss_avg,
+                                  'ema_val_loss_source': ema_val_loss_avg},
+                                  epoch)
+            else:
+                writer.add_scalars('losses', {'val_loss_target': val_loss_avg,
+                                  'ema_val_loss_target': ema_val_loss_avg},
+                                  epoch)
 
         end_time = time.time()
         total_time = end_time - start_time
