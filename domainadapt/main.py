@@ -2,6 +2,7 @@ import sys
 import json
 import time
 import numpy as np
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -84,6 +85,15 @@ def update_ema_variables(model, ema_model, alpha, global_step):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
 
+def threshold_predictions(predictions, thr=0.999):
+    thresholded_preds = predictions[:]
+    low_values_indices = thresholded_preds < thr
+    thresholded_preds[low_values_indices] = 0
+    low_values_indices = thresholded_preds >= thr
+    thresholded_preds[low_values_indices] = 1
+    return thresholded_preds
+
+
 def create_model(ctx, ema=False):
     drop_rate = ctx["drop_rate"]
     bn_momentum = ctx["bn_momentum"]
@@ -110,6 +120,26 @@ def create_loader(ctx, dataset, source=True):
 
 
 def cmd_train(ctx):
+    global_step = 0
+
+    supervised_only = ctx["supervised_only"]
+    use_consistency = ctx["use_consistency"]
+    num_epochs = ctx["num_epochs"]
+    num_workers = ctx["num_workers"]
+    experiment_name = ctx["experiment_name"]
+    cons_weight = ctx["cons_weight"]
+    initial_lr = ctx["initial_lr"]
+    consistency_rampup = ctx["consistency_rampup"]
+
+    if "constant" in ctx["decay_lr"]:
+        decay_lr_fn = decay_constant_lr
+
+    if "poly" in ctx["decay_lr"]:
+        decay_lr_fn = decay_poly_lr
+
+    if "cosine" in ctx["decay_lr"]:
+        decay_lr_fn = cosine_lr
+
     source_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
                                    site_ids=range(1, 4), subj_ids=range(1, 3), rater_ids=[4])
     target_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
@@ -143,24 +173,6 @@ def cmd_train(ctx):
     # #TODO add setter to transform
     source_train.transform = source_val.transform = source_transform
     target_train.transform = target_val.transform = target_transform
-
-    supervised_only = ctx["supervised_only"]
-    use_consistency = ctx["use_consistency"]
-    num_epochs = ctx["num_epochs"]
-    num_workers = ctx["num_workers"]
-    experiment_name = ctx["experiment_name"]
-    cons_weight = ctx["cons_weight"]
-    initial_lr = ctx["initial_lr"]
-    consistency_rampup = ctx["consistency_rampup"]
-
-    if "constant" in ctx["decay_lr"]:
-        decay_lr_fn = decay_constant_lr
-
-    if "poly" in ctx["decay_lr"]:
-        decay_lr_fn = decay_poly_lr
-
-    if "cosine" in ctx["decay_lr"]:
-        decay_lr_fn = cosine_lr
 
     source_train_loader = create_loader(ctx, source_train)
     target_train_loader = create_loader(ctx, target_train, source=False)
@@ -205,9 +217,13 @@ def cmd_train(ctx):
         model.train()
         model_ema.train()
 
-        task_loss = 0
+        task_loss_total = 0.0
+        consistency_loss_total = 0.0
+        loss_total = 0.0
+
         target_train_iter = iter(target_train_loader)
         j = 0
+        num_steps = 0
         for i, source_input in enumerate(source_train_loader): #TODO presumes first_set > second_set
             try:
                 target_input = target_train_iter.next()
@@ -231,10 +247,14 @@ def cmd_train(ctx):
                                                                 requires_grad=False).cuda()
 
             task_loss = dice_loss(student_source_out, s_var_gt)
+            task_loss_total += task_loss.data[0]
+
             consistency_loss = consistency_weight * F.binary_cross_entropy(student_target_out,
                                                                            teacher_target_out_nograd)
+            consistency_loss_total += consistency_loss.data[0]
 
             loss = task_loss + consistency_loss
+            loss_total += loss.data[0]
             optimizer.zero_grad()
             loss.backward()
             if ctx["clip_norm"]:
@@ -242,6 +262,120 @@ def cmd_train(ctx):
 
             optimizer.step()
 
+            num_steps += 1
+            global_step += 1
+
+            if epoch <= initial_lr_rampup:
+                update_ema_variables(model, model_ema, ctx["ema_alpha"], global_step)
+            else:
+                update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
+
+        loss_avg = loss_total / num_steps
+        task_loss_avg = task_loss_total / num_steps
+        consistency_loss_avg = consistency_loss_total / num_steps
+
+        tqdm.write("Steps p/ Epoch: {}".format(num_steps))
+        tqdm.write("Consistency Weight: {:.6f}".format(consistency_weight))
+        tqdm.write("Composite Loss: {:.6f}".format(loss_avg))
+        tqdm.write("Class Loss: {:.6f}".format(task_loss_avg))
+        tqdm.write("Consistency Loss: {:.6f}".format(consistency_loss_avg))
+
+        # Evaluation ####################################################################
+
+        # Evaluation mode
+        model.eval()
+        model_ema.eval()
+
+        metric_fns = [metrics.dice_score, metrics.jaccard_score, metrics.hausdorff_score,
+                      metrics.precision_score, metrics.recall_score,
+                      metrics.specificity_score, metrics.intersection_over_union,
+                      metrics.accuracy_score]
+
+        for loader in [source_val_loader, target_val_loader]:
+            val_loss = 0.0
+            ema_val_loss = 0.0
+            num_samples = 0
+            num_steps = 0
+
+            val_result_dict = defaultdict(float)
+            val_ema_result_dict = defaultdict(float)
+
+            if loader == source_val_loader:
+                tqdm.write("Evaluating Source Validation")
+            if loader == target_val_loader:
+                tqdm.write("Evaluating Target Validation")
+
+            for i, batch in enumerate(loader):
+                image, gt = batch["input"], batch["gt"]
+                var_image = torch.autograd.Variable(image, volatile=True).cuda()
+                var_gt = torch.autograd.Variable(gt, volatile=True).cuda(async=True)
+
+                model_out = model(var_image)
+                val_loss = dice_loss(model_out, var_gt)
+
+                model_ema_out = model_ema(var_image)
+                model_ema_out_nograd = torch.autograd.Variable(model_ema_out.detach().data, requires_grad=False)
+                ema_class_loss_out = dice_loss(model_ema_out_nograd, var_gt)
+                ema_val_loss += ema_class_loss_out.data[0]
+
+                gt_masks = gt.numpy().astype(np.uint8)
+                gt_masks = gt_masks.squeeze(axis=1)
+
+                preds = model_out.data.cpu().numpy()
+                preds = threshold_predictions(preds)
+                preds = preds.astype(np.uint8)
+                preds = preds.squeeze(axis=1)
+
+                preds_ema = model_ema_out.data.cpu().numpy()
+                preds_ema = threshold_predictions(preds_ema)
+                preds_ema = preds_ema.astype(np.uint8)
+                preds_ema = preds_ema.squeeze(axis=1)
+
+
+                for metric_fn in metric_fns:
+                    for prediction, ground_truth in zip(preds, gt_masks):
+                        res = metric_fn(prediction, ground_truth)
+                        dict_key = 'val_{}'.format(metric_fn.__name__)
+                        val_result_dict[dict_key] += res
+
+                for metric_fn in metric_fns:
+                    for prediction, ground_truth in zip(preds_ema, gt_masks):
+                        res = metric_fn(prediction, ground_truth)
+                        dict_key = 'val_ema_{}'.format(metric_fn.__name__)
+                        val_ema_result_dict[dict_key] += res
+
+                num_samples += len(preds)
+                num_steps += 1
+
+            #TODO check if validation is not inheriting anything from the for loop
+            for key, val in val_result_dict.items():
+                val_result_dict[key] = val / num_samples
+
+            if not supervised_only:
+                for key, val in val_ema_result_dict.items():
+                    val_ema_result_dict[key] = val / num_samples
+
+            val_loss_avg = val_loss / num_steps
+
+            tqdm.write("Val Loss:      {:.6f}".format(val_loss_avg.data[0]))
+            writer.add_scalars('metrics', val_result_dict, epoch)
+
+            ema_val_loss_avg = 0.0
+            if not supervised_only:
+                ema_val_loss_avg = ema_val_loss / num_steps
+                tqdm.write("Ema Val Loss:  {:.6f}".format(ema_val_loss_avg))
+                writer.add_scalars('metrics', val_ema_result_dict, epoch)
+
+            writer.add_scalars('losses', {'val_loss': val_loss_avg,
+                                          'ema_val_loss': ema_val_loss_avg,
+                                          'composite_loss': loss_avg,
+                                          'class_loss': task_loss_avg,
+                                          'consistency_loss': consistency_loss_avg},
+                                          epoch)
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        tqdm.write("Epoch {} took {:.2f} seconds.".format(epoch, total_time))
 
 
 def run_main():
