@@ -12,10 +12,10 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
-# import os
-# import sys
-# sys.path.insert(0, os.path.abspath('.'))
+import os
+import sys
 
+sys.path.insert(0, os.path.abspath('../..'))
 
 # -- Project information -----------------------------------------------------
 
@@ -24,7 +24,7 @@ copyright = '2018, Neuropoly and GPIN'
 author = 'Neuropoly and GPIN'
 
 # The short X.Y version
-version = ''
+version = '0.1'
 # The full version, including alpha/beta/rc tags
 release = '0.1'
 
@@ -46,6 +46,8 @@ extensions = [
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
+
+html_show_sourcelink = False
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
@@ -85,6 +87,15 @@ html_theme = 'alabaster'
 #
 # html_theme_options = {}
 
+html_theme_options = {
+    'logo': 'img/logo.png',
+    'github_user': 'neuropoly',
+    'github_repo': 'domainadaptation',
+    'github_button': True,
+    'github_banner': False,
+    'logo_name': False,
+}
+
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
@@ -99,6 +110,16 @@ html_static_path = ['_static']
 # 'searchbox.html']``.
 #
 # html_sidebars = {}
+
+html_sidebars = {
+    '**': [
+        'about.html',
+        'navigation.html',
+        'relations.html',
+        'searchbox.html',
+        'donate.html',
+    ]
+}
 
 
 # -- Options for HTMLHelp output ---------------------------------------------
