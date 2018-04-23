@@ -5,9 +5,9 @@ Repository for the Domain Adaptation work using the self-ensembling
 ## Installing requirements
 Requirements for this project:
 
-    * (required) Python 3.6 (use a virtual environment);
-    * (required) [SCT](https://github.com/neuropoly/spinalcordtoolbox)
-    * (optional) FSLeyes/FSLview/FSLutils
+* (required) Python 3.6 (use a virtual environment);
+* (required) [SCT](https://github.com/neuropoly/spinalcordtoolbox)
+* (optional) FSLeyes/FSLview/FSLutils
 
 These requirements are not included in the `setup.py` requirements, since
 they aren't *pip-installable*, so you need to install them before

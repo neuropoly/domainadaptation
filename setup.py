@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'domainadapt=domainadapt.main:run_main',
+            'gm_resample_training=domainadapt.preprocess:resample_training'
         ],
     },
 )
