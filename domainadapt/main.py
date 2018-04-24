@@ -99,7 +99,6 @@ def create_model(ctx, ema=False):
     drop_rate = ctx["drop_rate"]
     bn_momentum = ctx["bn_momentum"]
     model = Unet(drop_rate=drop_rate, bn_momentum=bn_momentum)
-    model = nn.DataParallel(model)
     model.cuda()
 
     if ema:
