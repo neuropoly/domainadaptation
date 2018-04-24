@@ -120,6 +120,77 @@ def create_loader(ctx, dataset, source=True):
                                        pin_memory=True)
 
 
+def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
+    val_loss = 0.0
+    ema_val_loss = 0.0
+    num_samples = 0
+    num_steps = 0
+
+    result_dict = defaultdict(float)
+    result_ema_dict = defaultdict(float)
+
+    for i, batch in enumerate(loader):
+        image, gt = batch["input"], batch["gt"]
+        var_image = torch.autograd.Variable(image, volatile=True).cuda()
+        var_gt = torch.autograd.Variable(gt, volatile=True).cuda(async=True)
+
+        model_out = model(var_image)
+        val_loss = dice_loss(model_out, var_gt)
+
+        model_ema_out = model_ema(var_image)
+        model_ema_out_nograd = torch.autograd.Variable(model_ema_out.detach().data, requires_grad=False)
+        ema_task_loss = dice_loss(model_ema_out_nograd, var_gt)
+        ema_val_loss += ema_task_loss.data[0]
+
+        gt_masks = gt.numpy().astype(np.uint8)
+        gt_masks = gt_masks.squeeze(axis=1)
+
+        preds = model_out.data.cpu().numpy()
+        preds = threshold_predictions(preds)
+        preds = preds.astype(np.uint8)
+        preds = preds.squeeze(axis=1)
+
+        for metric_fn in metric_fns:
+            for prediction, ground_truth in zip(preds, gt_masks):
+                res = metric_fn(prediction, ground_truth)
+                dict_key = 'val_{}'.format(metric_fn.__name__)
+                result_dict[dict_key] += res
+
+        preds_ema = model_ema_out.data.cpu().numpy()
+        preds_ema = threshold_predictions(preds_ema)
+        preds_ema = preds_ema.astype(np.uint8)
+        preds_ema = preds_ema.squeeze(axis=1)
+
+        for metric_fn in metric_fns:
+            for prediction, ground_truth in zip(preds_ema, gt_masks):
+                res = metric_fn(prediction, ground_truth)
+                dict_key = 'val_ema_{}'.format(metric_fn.__name__)
+                result_ema_dict[dict_key] += res
+
+        num_samples += len(preds)
+        num_steps += 1
+
+    #TODO check if validation is not inheriting anything from the for loop
+    for key, val in result_dict.items():
+        result_dict[key] = val / num_samples
+    for key, val in result_dict.items():
+        result_ema_dict[key] = val / num_samples
+
+    val_loss_avg = val_loss / num_steps
+
+    writer.add_scalars(prefix + '_' + 'metrics', result_dict, epoch)
+
+    ema_val_loss_avg = 0.0
+    ema_val_loss_avg = ema_val_loss / num_steps
+    tqdm.write("Ema Target Val Loss: {:.6f}".format(ema_val_loss_avg))
+    writer.add_scalars(prefix + '_metrics', result_ema_dict, epoch)
+
+    writer.add_scalars(prefix + '_losses', {'val_loss_source': val_loss_avg,
+                      'ema_val_loss_source': ema_val_loss_avg},
+                      epoch)
+
+
+
 def cmd_train(ctx):
     global_step = 0
 
@@ -302,7 +373,7 @@ def cmd_train(ctx):
                 tqdm.write("*** Error writing images ***")
 
         writer.add_scalars('losses', {'composite_loss': loss_avg,
-                           'class_loss': task_loss_avg,
+                           'task_loss': task_loss_avg,
                            'consistency_loss': consistency_loss_avg},
                            epoch)
 
@@ -317,89 +388,14 @@ def cmd_train(ctx):
                       metrics.specificity_score, metrics.intersection_over_union,
                       metrics.accuracy_score]
 
-        for loader in [source_val_loader, target_val_loader]:
-            val_loss = 0.0
-            ema_val_loss = 0.0
-            num_samples = 0
-            num_steps = 0
-
-            val_result_dict = defaultdict(float)
-            val_ema_result_dict = defaultdict(float)
-
-            if loader == source_val_loader:
-                tqdm.write("Evaluating Source Validation")
-            if loader == target_val_loader:
-                tqdm.write("Evaluating Target Validation")
-
-            for i, batch in enumerate(loader):
-                image, gt = batch["input"], batch["gt"]
-                var_image = torch.autograd.Variable(image, volatile=True).cuda()
-                var_gt = torch.autograd.Variable(gt, volatile=True).cuda(async=True)
-
-                model_out = model(var_image)
-                val_loss = dice_loss(model_out, var_gt)
-
-                model_ema_out = model_ema(var_image)
-                model_ema_out_nograd = torch.autograd.Variable(model_ema_out.detach().data, requires_grad=False)
-                ema_class_loss_out = dice_loss(model_ema_out_nograd, var_gt)
-                ema_val_loss += ema_class_loss_out.data[0]
-
-                gt_masks = gt.numpy().astype(np.uint8)
-                gt_masks = gt_masks.squeeze(axis=1)
-
-                preds = model_out.data.cpu().numpy()
-                preds = threshold_predictions(preds)
-                preds = preds.astype(np.uint8)
-                preds = preds.squeeze(axis=1)
-
-                preds_ema = model_ema_out.data.cpu().numpy()
-                preds_ema = threshold_predictions(preds_ema)
-                preds_ema = preds_ema.astype(np.uint8)
-                preds_ema = preds_ema.squeeze(axis=1)
-
-
-                for metric_fn in metric_fns:
-                    for prediction, ground_truth in zip(preds, gt_masks):
-                        res = metric_fn(prediction, ground_truth)
-                        dict_key = 'val_{}'.format(metric_fn.__name__)
-                        val_result_dict[dict_key] += res
-
-                for metric_fn in metric_fns:
-                    for prediction, ground_truth in zip(preds_ema, gt_masks):
-                        res = metric_fn(prediction, ground_truth)
-                        dict_key = 'val_ema_{}'.format(metric_fn.__name__)
-                        val_ema_result_dict[dict_key] += res
-
-                num_samples += len(preds)
-                num_steps += 1
-
-            #TODO check if validation is not inheriting anything from the for loop
-            for key, val in val_result_dict.items():
-                val_result_dict[key] = val / num_samples
-
-            if not supervised_only:
-                for key, val in val_ema_result_dict.items():
-                    val_ema_result_dict[key] = val / num_samples
-
-            val_loss_avg = val_loss / num_steps
-
-            tqdm.write("Val Loss:      {:.6f}".format(val_loss_avg.data[0]))
-            writer.add_scalars('metrics', val_result_dict, epoch)
-
-            ema_val_loss_avg = 0.0
-            if not supervised_only:
-                ema_val_loss_avg = ema_val_loss / num_steps
-                tqdm.write("Ema Val Loss:  {:.6f}".format(ema_val_loss_avg))
-                writer.add_scalars('metrics', val_ema_result_dict, epoch)
-
-            if loader == source_val_loader:
-                writer.add_scalars('losses', {'val_loss_source': val_loss_avg,
-                                  'ema_val_loss_source': ema_val_loss_avg},
-                                  epoch)
-            else:
-                writer.add_scalars('losses', {'val_loss_target': val_loss_avg,
-                                  'ema_val_loss_target': ema_val_loss_avg},
-                                  epoch)
+        validation(model, model_ema,
+                   source_val_loader,
+                   writer, metric_fns,
+                   epoch, 'source_val')
+        validation(model, model_ema,
+                   target_val_loader,
+                   writer, metric_fns,
+                   epoch, 'target_val')
 
         end_time = time.time()
         total_time = end_time - start_time
