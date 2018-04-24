@@ -22,6 +22,7 @@ import torchvision.utils as vutils
 from tqdm import *
 from tensorboardX import SummaryWriter
 
+
 def decay_poly_lr(current_epoch, num_epochs, initial_lr):
     initial_lrate = initial_lr
     factor = 1.0 - (current_epoch / num_epochs)
@@ -189,18 +190,15 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
                       epoch)
 
 
-
 def cmd_train(ctx):
     global_step = 0
 
-    supervised_only = ctx["supervised_only"]
-    use_consistency = ctx["use_consistency"]
     num_epochs = ctx["num_epochs"]
-    num_workers = ctx["num_workers"]
     experiment_name = ctx["experiment_name"]
     cons_weight = ctx["cons_weight"]
     initial_lr = ctx["initial_lr"]
     consistency_rampup = ctx["consistency_rampup"]
+    weight_decay = ctx["weight_decay"]
 
     if "constant" in ctx["decay_lr"]:
         decay_lr_fn = decay_constant_lr
@@ -214,7 +212,7 @@ def cmd_train(ctx):
     source_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
                                    site_ids=range(1, 4), subj_ids=range(1, 3), rater_ids=[4])
     target_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
-                                   site_ids=[4], subj_ids=range(1,3), rater_ids=[4])
+                                   site_ids=[4], subj_ids=range(1, 3), rater_ids=[4])
 
     source_val = SCGMChallenge2D(ctx["rootdir_gmchallenge"],
                                  site_ids=range(1,4), subj_ids=range(8, 11), rater_ids=[4])
@@ -255,7 +253,7 @@ def cmd_train(ctx):
 
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=initial_lr,
-                                 weight_decay=ctx["weight_decay"])
+                                 weight_decay=weight_decay)
 
     writer = SummaryWriter(log_dir="log_{}".format(experiment_name))
 
@@ -293,7 +291,6 @@ def cmd_train(ctx):
         loss_total = 0.0
 
         target_train_iter = iter(target_train_loader)
-        j = 0
         num_steps = 0
         for i, source_input in enumerate(source_train_loader): #TODO presumes first_set > second_set
             try:
