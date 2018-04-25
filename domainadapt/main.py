@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from dataset.transforms import MTGaussianNoise
+from dataset.transforms import MTGaussianNoise, random_rotation
 
 from medicaltorch.models import Unet, NoPoolASPP
 from medicaltorch.datasets import SCGMChallenge2D
@@ -181,15 +181,13 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
 
     val_loss_avg = val_loss / num_steps
 
-    writer.add_scalars(prefix + '_' + 'metrics', result_dict, epoch)
-
     ema_val_loss_avg = 0.0
     ema_val_loss_avg = ema_val_loss / num_steps
-    tqdm.write("Ema Target Val Loss: {:.6f}".format(ema_val_loss_avg))
-    writer.add_scalars(prefix + '_metrics', result_ema_dict, epoch)
 
-    writer.add_scalars(prefix + '_losses', {'val_loss_source': val_loss_avg,
-                      'ema_val_loss_source': ema_val_loss_avg},
+    writer.add_scalars(prefix + '_metrics', result_dict, epoch)
+    writer.add_scalars(prefix + '_ema_metrics', result_ema_dict, epoch)
+    writer.add_scalars(prefix + '_losses', {prefix + '_loss': val_loss_avg,
+                      prefix + '_ema_loss': ema_val_loss_avg},
                       epoch)
 
 
@@ -232,24 +230,25 @@ def cmd_train(ctx):
     source_transform = tv.transforms.Compose([
         # mt_transform.ToPIL(),
         mt_transform.CenterCrop2D((200, 200)),
+        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
         mt_transform.ToTensor(),
         mt_transform.Normalize(source_train_mean, source_train_std),
     ])
 
     target_transform = tv.transforms.Compose([
         mt_transform.CenterCrop2D((200, 200)),
+        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
         mt_transform.ToTensor(),
         mt_transform.Normalize(target_train_mean, target_train_std),
     ])
 
     target_student_transform = tv.transforms.Compose([
         mt_transform.ToPIL(),
-        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
+        mt_transform.RandomRotation(ctx["aug_rotation_range"]),
         mt_transform.ToTensor(),
     ])
-    target_teacher_transform = tv.transforms.Compose([
+    target_teacher_transform = tv.transforms.Compose([ #TODO now identity, keeping it here for future (maybe link parameters for both transforms)
         mt_transform.ToPIL(),
-        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]), #*2 for whatever
         mt_transform.ToTensor(),
     ])
 
@@ -315,31 +314,43 @@ def cmd_train(ctx):
                 target_train_iter = iter(target_train_loader)
                 target_input = target_train_iter.next()
 
-            student_samples = []
+            # Apply transforms on target student samples
+            student_dict_list = []
             teacher_samples = []
             for sample in mt_dataset.BatchSplit(target_input):
-                sample_teacher = sample.copy()
-                student_samples.append(target_student_transform(sample)['input'])
-                teacher_samples.append(target_teacher_transform(sample_teacher)['input'])
+                sample_student = sample.copy()
+                student_dict_list.append(target_student_transform(sample_student))
+
+            student_samples = [torch.unsqueeze(sample['input'], 0) for sample in student_dict_list]
+            student_samples = torch.cat(student_samples, 0)
+            student_samples = torch.autograd.Variable(student_samples).cuda()
 
             s_image, s_gt = source_input["input"], source_input["gt"]
-            # t_image = target_input["input"]
-            for i, t in enumerate(student_samples):
-                student_samples[i] = torch.unsqueeze(student_samples[i], 0)
-                teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
-
-            student_samples = torch.cat(student_samples, 0)
-            teacher_samples = torch.cat(teacher_samples, 0)
-
-            """CHECK"""
             s_var_image = torch.autograd.Variable(s_image).cuda()
             s_var_gt = torch.autograd.Variable(s_gt).cuda(async=True)
-            student_samples = torch.autograd.Variable(student_samples).cuda()
-            teacher_samples = torch.autograd.Variable(teacher_samples).cuda()
 
+            t_image = target_input["input"]
+            t_var_image = torch.autograd.Variable(t_image).cuda()
+
+
+            # Inference for source and target on student
             student_source_out = model(s_var_image)
             student_target_out = model(student_samples)
-            teacher_target_out = model_ema(teacher_samples)
+
+            # Inference for target on nonrotated images
+            teacher_target_out = model_ema(t_var_image)
+            for teacher_out, student_sample in zip(teacher_target_out, student_dict_list):
+                metadata = student_sample['input_metadata']
+                teacher_samples.append(torch.tensor(random_rotation(teacher_out.cpu().numpy(), metadata["__rotation"])))
+                # teacher_samples.append(target_teacher_transform(sample_teacher)['input']) #TODO use more MT
+
+            for i, t in enumerate(teacher_samples):
+                teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
+            teacher_samples = torch.cat(teacher_samples, 0)
+
+            # Inference for target on teacher
+            teacher_target_out = torch.autograd.Variable(teacher_samples).cuda()
+
             #TODO fixed in torch 0.4
             teacher_target_out_nograd = torch.autograd.Variable(torch.from_numpy(teacher_target_out.data.cpu().numpy()),
                                                                 requires_grad=False).cuda()
@@ -375,7 +386,7 @@ def cmd_train(ctx):
         tqdm.write("Steps p/ Epoch: {}".format(num_steps))
         tqdm.write("Consistency Weight: {:.6f}".format(consistency_weight))
         tqdm.write("Composite Loss: {:.6f}".format(loss_avg))
-        tqdm.write("Class Loss: {:.6f}".format(task_loss_avg))
+        tqdm.write("Task Loss: {:.6f}".format(task_loss_avg))
         tqdm.write("Consistency Loss: {:.6f}".format(consistency_loss_avg))
 
         # Write sample images
