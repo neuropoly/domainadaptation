@@ -8,12 +8,15 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from dataset.transforms import MTGaussianNoise
+
 from medicaltorch.models import Unet, NoPoolASPP
 from medicaltorch.datasets import SCGMChallenge2D
 from medicaltorch.datasets import mt_collate
 from medicaltorch.losses import dice_loss
 
 import medicaltorch.metrics as metrics
+import medicaltorch.datasets as mt_dataset
 import medicaltorch.transforms as mt_transform
 
 import torchvision as tv
@@ -238,6 +241,19 @@ def cmd_train(ctx):
         mt_transform.ToTensor(),
         mt_transform.Normalize(target_train_mean, target_train_std),
     ])
+
+    target_student_transform = tv.transforms.Compose([
+        mt_transform.ToPIL(),
+        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
+        mt_transform.ToTensor(),
+    ])
+    target_teacher_transform = tv.transforms.Compose([
+        mt_transform.ToPIL(),
+        MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]), #*2 for whatever
+        mt_transform.ToTensor(),
+    ])
+
+
     #
     # #TODO add setter to transform
     source_train.transform = source_val.transform = source_transform
@@ -299,17 +315,31 @@ def cmd_train(ctx):
                 target_train_iter = iter(target_train_loader)
                 target_input = target_train_iter.next()
 
-            s_image, s_gt = source_input["input"], source_input["gt"]
-            t_image = target_input["input"]
+            student_samples = []
+            teacher_samples = []
+            for sample in mt_dataset.BatchSplit(target_input):
+                sample_teacher = sample.copy()
+                student_samples.append(target_student_transform(sample)['input'])
+                teacher_samples.append(target_teacher_transform(sample_teacher)['input'])
 
+            s_image, s_gt = source_input["input"], source_input["gt"]
+            # t_image = target_input["input"]
+            for i, t in enumerate(student_samples):
+                student_samples[i] = torch.unsqueeze(student_samples[i], 0)
+                teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
+
+            student_samples = torch.cat(student_samples, 0)
+            teacher_samples = torch.cat(teacher_samples, 0)
+
+            """CHECK"""
             s_var_image = torch.autograd.Variable(s_image).cuda()
             s_var_gt = torch.autograd.Variable(s_gt).cuda(async=True)
-
-            t_var_image = torch.autograd.Variable(t_image).cuda()
+            student_samples = torch.autograd.Variable(student_samples).cuda()
+            teacher_samples = torch.autograd.Variable(teacher_samples).cuda()
 
             student_source_out = model(s_var_image)
-            student_target_out = model(t_var_image)
-            teacher_target_out = model_ema(t_var_image)
+            student_target_out = model(student_samples)
+            teacher_target_out = model_ema(teacher_samples)
             #TODO fixed in torch 0.4
             teacher_target_out_nograd = torch.autograd.Variable(torch.from_numpy(teacher_target_out.data.cpu().numpy()),
                                                                 requires_grad=False).cuda()
