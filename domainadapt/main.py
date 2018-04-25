@@ -134,8 +134,9 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
 
     for i, batch in enumerate(loader):
         image, gt = batch["input"], batch["gt"]
-        var_image = torch.autograd.Variable(image, volatile=True).cuda()
-        var_gt = torch.autograd.Variable(gt, volatile=True).cuda(async=True)
+        with torch.no_grad():
+            var_image = torch.autograd.Variable(image).cuda()
+            var_gt = torch.autograd.Variable(gt).cuda(async=True)
 
         model_out = model(var_image)
         val_loss = dice_loss(model_out, var_gt)
@@ -143,7 +144,7 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
         model_ema_out = model_ema(var_image)
         model_ema_out_nograd = torch.autograd.Variable(model_ema_out.detach().data, requires_grad=False)
         ema_task_loss = dice_loss(model_ema_out_nograd, var_gt)
-        ema_val_loss += ema_task_loss.data[0]
+        ema_val_loss += ema_task_loss.item()
 
         gt_masks = gt.numpy().astype(np.uint8)
         gt_masks = gt_masks.squeeze(axis=1)
@@ -316,7 +317,6 @@ def cmd_train(ctx):
 
             # Apply transforms on target student samples
             student_dict_list = []
-            teacher_samples = []
             for sample in mt_dataset.BatchSplit(target_input):
                 sample_student = sample.copy()
                 student_dict_list.append(target_student_transform(sample_student))
@@ -329,16 +329,15 @@ def cmd_train(ctx):
             s_var_image = torch.autograd.Variable(s_image).cuda()
             s_var_gt = torch.autograd.Variable(s_gt).cuda(async=True)
 
-            t_image = target_input["input"]
-            t_var_image = torch.autograd.Variable(t_image).cuda()
-
-
             # Inference for source and target on student
             student_source_out = model(s_var_image)
             student_target_out = model(student_samples)
 
-            # Inference for target on nonrotated images
+            # Inference for target on non transformed images
+            t_image = target_input["input"]
+            t_var_image = torch.autograd.Variable(t_image).cuda()
             teacher_target_out = model_ema(t_var_image)
+            teacher_samples = []
             for teacher_out, student_sample in zip(teacher_target_out, student_dict_list):
                 metadata = student_sample['input_metadata']
                 teacher_samples.append(torch.tensor(random_rotation(teacher_out.cpu().numpy(), metadata["__rotation"])))
@@ -347,25 +346,20 @@ def cmd_train(ctx):
             for i, t in enumerate(teacher_samples):
                 teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
             teacher_samples = torch.cat(teacher_samples, 0)
-
-            # Inference for target on teacher
-            teacher_target_out = torch.autograd.Variable(teacher_samples).cuda()
-
-            #TODO fixed in torch 0.4
-            teacher_target_out_nograd = torch.autograd.Variable(torch.from_numpy(teacher_target_out.data.cpu().numpy()),
+            teacher_target_out_nograd = torch.autograd.Variable(teacher_samples,
                                                                 requires_grad=False).cuda()
 
             task_loss = dice_loss(student_source_out, s_var_gt)
-            task_loss_total += task_loss.data[0]
+            task_loss_total += task_loss.item()
 
             consistency_loss = F.binary_cross_entropy(student_target_out,
                                                       teacher_target_out_nograd)
-            consistency_loss_total += consistency_loss.data[0]
-            consistency_loss = consistency_weight * consistency_loss 
+            consistency_loss_total += consistency_loss.item()
+            consistency_loss = (consistency_weight * consistency_loss) / ctx["target_batch_size"]
 
 
             loss = task_loss + consistency_loss
-            loss_total += loss.data[0]
+            loss_total += loss.item()
             optimizer.zero_grad()
             loss.backward()
             if ctx["clip_norm"]:
