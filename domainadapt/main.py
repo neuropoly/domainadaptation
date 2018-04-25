@@ -256,7 +256,7 @@ def cmd_train(ctx):
     #
     # #TODO add setter to transform
     source_train.transform = source_val.transform = source_transform
-    target_train.transform = target_val.transform = target_transform
+    target_train.transform = target_val.transform = target_transform #TODO validation shouldn't be the same transforms, keeping due to centercrop
 
     source_train_loader = create_loader(ctx, source_train)
     target_train_loader = create_loader(ctx, target_train, source=False)
@@ -358,9 +358,11 @@ def cmd_train(ctx):
             task_loss = dice_loss(student_source_out, s_var_gt)
             task_loss_total += task_loss.data[0]
 
-            consistency_loss = consistency_weight * F.binary_cross_entropy(student_target_out,
-                                                                           teacher_target_out_nograd)
+            consistency_loss = F.binary_cross_entropy(student_target_out,
+                                                      teacher_target_out_nograd)
             consistency_loss_total += consistency_loss.data[0]
+            consistency_loss = consistency_weight * consistency_loss 
+
 
             loss = task_loss + consistency_loss
             loss_total += loss.data[0]
