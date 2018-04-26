@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from dataset.transforms import MTGaussianNoise, random_rotation
+from .dataset.transforms import MTGaussianNoise, random_rotation
 
 from medicaltorch.models import Unet, NoPoolASPP
 from medicaltorch.datasets import SCGMChallenge2D
@@ -225,6 +225,7 @@ def cmd_train(ctx):
 
     source_train_mean, source_train_std = source_train.compute_mean_std()
     target_train_mean, target_train_std = target_train.compute_mean_std()
+
     # if sys.version_info >= (3, 0):
     #     source_train_mean, source_train_std = [source_train_mean]*ctx["source_batch_size"], [source_train_std]*ctx["source_batch_size"]
     #     target_train_mean, target_train_std = [target_train_mean]*ctx["target_batch_size"], [target_train_std]*ctx["target_batch_size"]
@@ -235,14 +236,14 @@ def cmd_train(ctx):
         mt_transform.CenterCrop2D((200, 200)),
         MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
         mt_transform.ToTensor(),
-        mt_transform.Normalize(source_train_mean, source_train_std),
+        mt_transform.Normalize([source_train_mean], [source_train_std]),
     ])
 
     target_transform = tv.transforms.Compose([
         mt_transform.CenterCrop2D((200, 200)),
         MTGaussianNoise(0.0, ctx["aug_gaussian_noise"]),
         mt_transform.ToTensor(),
-        mt_transform.Normalize(target_train_mean, target_train_std),
+        mt_transform.Normalize([target_train_mean], [target_train_std]),
     ])
 
     target_student_transform = tv.transforms.Compose([
