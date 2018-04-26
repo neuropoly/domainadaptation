@@ -14,6 +14,7 @@ from medicaltorch.models import Unet, NoPoolASPP
 from medicaltorch.datasets import SCGMChallenge2D
 from medicaltorch.datasets import mt_collate
 from medicaltorch.losses import dice_loss
+from medicaltorch.filters import SliceFilter
 
 import medicaltorch.metrics as metrics
 import medicaltorch.datasets as mt_dataset
@@ -211,14 +212,15 @@ def cmd_train(ctx):
     if "cosine" in ctx["decay_lr"]:
         decay_lr_fn = cosine_lr
 
-    source_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
+    slice_filter = SliceFilter()
+    source_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], slice_filter_fn=slice_filter,# 1 - 3 = train
                                    site_ids=range(1, 4), subj_ids=range(1, 3), rater_ids=[4])
-    target_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], # 1 - 3 = train
+    target_train = SCGMChallenge2D(ctx["rootdir_gmchallenge"], slice_filter_fn=slice_filter,# 1 - 3 = train
                                    site_ids=[4], subj_ids=range(1, 3), rater_ids=[4])
 
-    source_val = SCGMChallenge2D(ctx["rootdir_gmchallenge"],
+    source_val = SCGMChallenge2D(ctx["rootdir_gmchallenge"], slice_filter_fn=slice_filter,
                                  site_ids=range(1,4), subj_ids=range(8, 11), rater_ids=[4])
-    target_val = SCGMChallenge2D(ctx["rootdir_gmchallenge"],
+    target_val = SCGMChallenge2D(ctx["rootdir_gmchallenge"], slice_filter_fn=slice_filter,
                                  site_ids=[4], subj_ids=range(8, 11), rater_ids=[4])
 
     source_train_mean, source_train_std = source_train.compute_mean_std()
