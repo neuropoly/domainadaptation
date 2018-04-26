@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from .dataset.transforms import MTGaussianNoise, random_rotation
 
 from medicaltorch.models import Unet, NoPoolASPP
-from medicaltorch.datasets import SCGMChallenge2D
+from medicaltorch.datasets import SCGMChallenge2DTrain
 from medicaltorch.datasets import mt_collate
 from medicaltorch.losses import dice_loss
 from medicaltorch.filters import SliceFilter
@@ -215,25 +215,25 @@ def cmd_train(ctx):
     if "cosine" in ctx["decay_lr"]:
         decay_lr_fn = cosine_lr
 
-    source_train = SCGMChallenge2D(rootdir_gmchallenge,
+    source_train = SCGMChallenge2DTrain(rootdir_gmchallenge,
                                    slice_filter_fn=SliceFilter(),
                                    site_ids=range(1, 4),
                                    subj_ids=range(1, 3),
                                    rater_ids=[4])
 
-    target_train = SCGMChallenge2D(rootdir_gmchallenge,
+    target_train = SCGMChallenge2DTrain(rootdir_gmchallenge,
                                    slice_filter_fn=SliceFilter(),
                                    site_ids=[4],
                                    subj_ids=range(1, 3),
                                    rater_ids=[4])
 
-    source_val = SCGMChallenge2D(rootdir_gmchallenge,
+    source_val = SCGMChallenge2DTrain(rootdir_gmchallenge,
                                  slice_filter_fn=SliceFilter(),
                                  site_ids=range(1,4),
                                  subj_ids=range(8, 11),
                                  rater_ids=[4])
 
-    target_val = SCGMChallenge2D(rootdir_gmchallenge,
+    target_val = SCGMChallenge2DTrain(rootdir_gmchallenge,
                                  slice_filter_fn=SliceFilter(),
                                  site_ids=[4],
                                  subj_ids=range(8, 11),
@@ -242,7 +242,7 @@ def cmd_train(ctx):
     source_train_mean, source_train_std = source_train.compute_mean_std()
     target_train_mean, target_train_std = target_train.compute_mean_std()
 
-    #TODO apply different dropout, noise and translation
+    # TODO apply different dropout, noise and translation
     source_transform = tv.transforms.Compose([
         mt_transform.CenterCrop2D((200, 200)),
         mt_transform.AdditiveGaussianNoise(0.0, aug_gaussian_noise),
