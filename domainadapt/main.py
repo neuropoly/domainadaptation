@@ -110,17 +110,6 @@ def create_model(ctx, ema=False):
     return model.cuda()
 
 
-def create_loader(ctx, dataset, source=True):
-    batch_size = ctx["source_batch_size"] if source else ctx["target_batch_size"]
-    return DataLoader(dataset,
-                      batch_size=batch_size,
-                      shuffle=True,
-                      drop_last=True,
-                      num_workers=ctx["num_workers"],
-                      collate_fn=mt_collate,
-                      pin_memory=True)
-
-
 def validation(model, model_ema, loader, writer,
                metric_fns, epoch, ctx, prefix):
     val_loss = 0.0
