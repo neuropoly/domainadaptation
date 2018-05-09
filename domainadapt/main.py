@@ -3,22 +3,19 @@ import json
 import time
 import numpy as np
 from collections import defaultdict
+import itertools
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from torch.nn import functional as F
 
-from .dataset.transforms import MTGaussianNoise, random_rotation
-
-from medicaltorch.models import Unet, NoPoolASPP
-from medicaltorch.datasets import SCGMChallenge2DTrain
-from medicaltorch.datasets import mt_collate
-from medicaltorch.losses import dice_loss
-from medicaltorch.filters import SliceFilter
-
-import medicaltorch.metrics as metrics
-import medicaltorch.datasets as mt_dataset
-import medicaltorch.transforms as mt_transform
+import medicaltorch.filters as mt_filters
+import medicaltorch.losses as mt_losses
+import medicaltorch.models as mt_models
+import medicaltorch.metrics as mt_metrics
+import medicaltorch.datasets as mt_datasets
+import medicaltorch.transforms as mt_transforms
 
 import torchvision as tv
 import torchvision.utils as vutils
@@ -103,30 +100,32 @@ def threshold_predictions(predictions, thr=0.999):
 def create_model(ctx, ema=False):
     drop_rate = ctx["drop_rate"]
     bn_momentum = ctx["bn_momentum"]
-    model = Unet(drop_rate=drop_rate, bn_momentum=bn_momentum)
-    model.cuda()
+    model = mt_models.Unet(drop_rate=drop_rate,
+                           bn_momentum=bn_momentum)
 
     if ema:
         for param in model.parameters():
             param.detach_()
 
-    return model
+    return model.cuda()
 
 
 def create_loader(ctx, dataset, source=True):
     batch_size = ctx["source_batch_size"] if source else ctx["target_batch_size"]
-    return torch.utils.data.DataLoader(dataset,
-                                       batch_size=batch_size,
-                                       shuffle=True,
-                                       drop_last=True,
-                                       num_workers=ctx["num_workers"],
-                                       collate_fn=mt_collate,
-                                       pin_memory=True)
+    return DataLoader(dataset,
+                      batch_size=batch_size,
+                      shuffle=True,
+                      drop_last=True,
+                      num_workers=ctx["num_workers"],
+                      collate_fn=mt_collate,
+                      pin_memory=True)
 
 
-def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
+def validation(model, model_ema, loader, writer,
+               metric_fns, epoch, ctx, prefix):
     val_loss = 0.0
     ema_val_loss = 0.0
+
     num_samples = 0
     num_steps = 0
 
@@ -134,23 +133,25 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
     result_ema_dict = defaultdict(float)
 
     for i, batch in enumerate(loader):
-        image, gt = batch["input"], batch["gt"]
+        input_data, gt_data = batch["input"], batch["gt"]
+
+        input_data_gpu = input_data.cuda()
+        gt_data_gpu = gt_data.cuda(async=True)
+
         with torch.no_grad():
-            var_image = torch.autograd.Variable(image).cuda()
-            var_gt = torch.autograd.Variable(gt).cuda(async=True)
+            model_out = model(input_data_gpu)
+            val_class_loss = mt_losses.dice_loss(model_out, gt_data_gpu)
+            val_loss += val_class_loss.item()
 
-        model_out = model(var_image)
-        val_loss = dice_loss(model_out, var_gt)
+            if not ctx["supervised_only"]:
+                model_ema_out = model_ema(input_data_gpu)
+                ema_val_class_loss = mt_losses.dice_loss(model_ema_out, gt_data_gpu)
+                ema_val_loss += ema_val_class_loss.item()
 
-        model_ema_out = model_ema(var_image)
-        model_ema_out_nograd = torch.autograd.Variable(model_ema_out.detach().data, requires_grad=False)
-        ema_task_loss = dice_loss(model_ema_out_nograd, var_gt)
-        ema_val_loss += ema_task_loss.item()
-
-        gt_masks = gt.numpy().astype(np.uint8)
+        gt_masks = gt_data_gpu.cpu().numpy().astype(np.uint8)
         gt_masks = gt_masks.squeeze(axis=1)
 
-        preds = model_out.data.cpu().numpy()
+        preds = model_out.cpu().numpy()
         preds = threshold_predictions(preds)
         preds = preds.astype(np.uint8)
         preds = preds.squeeze(axis=1)
@@ -161,50 +162,94 @@ def validation(model, model_ema, loader, writer, metric_fns, epoch, prefix):
                 dict_key = 'val_{}'.format(metric_fn.__name__)
                 result_dict[dict_key] += res
 
-        preds_ema = model_ema_out.data.cpu().numpy()
-        preds_ema = threshold_predictions(preds_ema)
-        preds_ema = preds_ema.astype(np.uint8)
-        preds_ema = preds_ema.squeeze(axis=1)
+        if not ctx["supervised_only"]:
+            preds_ema = model_ema_out.cpu().numpy()
+            preds_ema = threshold_predictions(preds_ema)
+            preds_ema = preds_ema.astype(np.uint8)
+            preds_ema = preds_ema.squeeze(axis=1)
 
-        for metric_fn in metric_fns:
-            for prediction, ground_truth in zip(preds_ema, gt_masks):
-                res = metric_fn(prediction, ground_truth)
-                dict_key = 'val_ema_{}'.format(metric_fn.__name__)
-                result_ema_dict[dict_key] += res
+            for metric_fn in metric_fns:
+                for prediction, ground_truth in zip(preds_ema, gt_masks):
+                    res = metric_fn(prediction, ground_truth)
+                    dict_key = 'val_ema_{}'.format(metric_fn.__name__)
+                    result_ema_dict[dict_key] += res
 
         num_samples += len(preds)
         num_steps += 1
 
-    #TODO check if validation is not inheriting anything from the for loop
-    for key, val in result_dict.items():
-        result_dict[key] = val / num_samples
-    for key, val in result_dict.items():
-        result_ema_dict[key] = val / num_samples
-
     val_loss_avg = val_loss / num_steps
 
-    ema_val_loss_avg = 0.0
-    ema_val_loss_avg = ema_val_loss / num_steps
+    for key, val in result_dict.items():
+        result_dict[key] = val / num_samples
+
+    if not ctx["supervised_only"]:
+        for key, val in result_ema_dict.items():
+            result_ema_dict[key] = val / num_samples
+
+        ema_val_loss_avg = ema_val_loss / num_steps
+        writer.add_scalars(prefix + '_ema_metrics', result_ema_dict, epoch)
+        writer.add_scalars(prefix + '_losses', {
+                           prefix + '_loss': val_loss_avg,
+                           prefix + '_ema_loss': ema_val_loss_avg
+                       },
+                       epoch)
+    else:
+        writer.add_scalars(prefix + '_losses', {
+                           prefix + '_loss': val_loss_avg,
+                       },
+                       epoch)
 
     writer.add_scalars(prefix + '_metrics', result_dict, epoch)
-    writer.add_scalars(prefix + '_ema_metrics', result_ema_dict, epoch)
-    writer.add_scalars(prefix + '_losses', {prefix + '_loss': val_loss_avg,
-                      prefix + '_ema_loss': ema_val_loss_avg},
-                      epoch)
+
+
+def linked_batch_augmentation(input_batch, preds_unsup):
+
+    # Teach transformation
+    teacher_transform = tv.transforms.Compose([
+        mt_transforms.ToPIL(labeled=False),
+        mt_transforms.ElasticTransform(alpha_range=(28.0, 30.0),
+                                       sigma_range=(3.5, 4.0),
+                                       p=0.3, labeled=False),
+        mt_transforms.RandomAffine(degrees=4.6,
+                                   scale=(0.98, 1.02),
+                                   translate=(0.03, 0.03),
+                                   labeled=False),
+        mt_transforms.RandomTensorChannelShift((-0.10, 0.10)),
+        mt_transforms.ToTensor(labeled=False),
+    ])
+
+    input_batch_size = input_batch.size(0)
+
+    input_batch_cpu = input_batch.cpu().detach()
+    input_batch_cpu = input_batch_cpu.numpy()
+
+    preds_unsup_cpu = preds_unsup.cpu().detach()
+    preds_unsup_cpu = preds_unsup_cpu.numpy()
+
+    samples_linked_aug = []
+    for sample_idx in range(input_batch_size):
+        sample_linked_aug = {'input': [input_batch_cpu[sample_idx],
+                                       preds_unsup_cpu[sample_idx]]}
+        out = teacher_transform(sample_linked_aug)
+        samples_linked_aug.append(out)
+
+    samples_linked_aug = mt_datasets.mt_collate(samples_linked_aug)
+    return samples_linked_aug
 
 
 def cmd_train(ctx):
     global_step = 0
 
+    num_workers = ctx["num_workers"]
     num_epochs = ctx["num_epochs"]
     experiment_name = ctx["experiment_name"]
     cons_weight = ctx["cons_weight"]
     initial_lr = ctx["initial_lr"]
     consistency_rampup = ctx["consistency_rampup"]
     weight_decay = ctx["weight_decay"]
-    rootdir_gmchallenge = ctx["rootdir_gmchallenge"]
-    aug_gaussian_noise = ctx["aug_gaussian_noise"]
-    aug_rotation_range = ctx["aug_rotation_range"]
+    rootdir_gmchallenge_train = ctx["rootdir_gmchallenge_train"]
+    rootdir_gmchallenge_test = ctx["rootdir_gmchallenge_test"]
+    supervised_only = ctx["supervised_only"]
 
     if "constant" in ctx["decay_lr"]:
         decay_lr_fn = decay_constant_lr
@@ -215,72 +260,88 @@ def cmd_train(ctx):
     if "cosine" in ctx["decay_lr"]:
         decay_lr_fn = cosine_lr
 
-    source_train = SCGMChallenge2DTrain(rootdir_gmchallenge,
-                                   slice_filter_fn=SliceFilter(),
-                                   site_ids=range(1, 4),
-                                   subj_ids=range(1, 3),
-                                   rater_ids=[4])
+    # Xs, Ys = Source input and source label, train
+    # Xt1, Xt2 = Target, domain adaptation, no label, different aug (same sample), train
+    # Xv, Yv = Target input and target label, validation
 
-    target_train = SCGMChallenge2DTrain(rootdir_gmchallenge,
-                                   slice_filter_fn=SliceFilter(),
-                                   site_ids=[4],
-                                   subj_ids=range(1, 3),
-                                   rater_ids=[4])
+    # Sample Xs and Ys from this
+    source_train = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
+                                                    slice_filter_fn=mt_filters.SliceFilter(),
+                                                    site_ids=[1, 2],
+                                                    subj_ids=range(1, 11))
 
-    source_val = SCGMChallenge2DTrain(rootdir_gmchallenge,
-                                 slice_filter_fn=SliceFilter(),
-                                 site_ids=range(1,4),
-                                 subj_ids=range(8, 11),
-                                 rater_ids=[4])
+    # Sample Xt1, Xt2 from this
+    unlabeled_filter = mt_filters.SliceFilter(filter_empty_mask=False)
+    target_adapt_train = mt_datasets.SCGMChallenge2DTest(rootdir_gmchallenge_test,
+                                                         slice_filter_fn=unlabeled_filter,
+                                                         site_ids=[3],
+                                                         subj_ids=range(11, 21))
 
-    target_val = SCGMChallenge2DTrain(rootdir_gmchallenge,
-                                 slice_filter_fn=SliceFilter(),
-                                 site_ids=[4],
-                                 subj_ids=range(8, 11),
-                                 rater_ids=[4])
+    # Sample Xv, Yv from this
+    target_validation = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
+                                                         slice_filter_fn=mt_filters.SliceFilter(),
+                                                         site_ids=[3],
+                                                         subj_ids=range(1, 11))
 
-    source_train_mean, source_train_std = source_train.compute_mean_std()
-    target_train_mean, target_train_std = target_train.compute_mean_std()
+    source_train_mean, source_train_std = source_train.compute_mean_std(True)
+    target_adapt_train_mean, target_adapt_train_std = target_adapt_train.compute_mean_std(True)
 
-    # TODO apply different dropout, noise and translation
+    # Training source data augmentation
     source_transform = tv.transforms.Compose([
-        mt_transform.CenterCrop2D((200, 200)),
-        mt_transform.AdditiveGaussianNoise(0.0, aug_gaussian_noise),
-        mt_transform.ToTensor(),
-        mt_transform.Normalize([source_train_mean], [source_train_std]),
+        mt_transforms.CenterCrop2D((200, 200)),
+        mt_transforms.ElasticTransform(alpha_range=(28.0, 30.0),
+                                       sigma_range=(3.5, 4.0),
+                                       p=0.3),
+        mt_transforms.RandomAffine(degrees=4.6,
+                                   scale=(0.98, 1.02),
+                                   translate=(0.03, 0.03)),
+        mt_transforms.RandomTensorChannelShift((-0.10, 0.10)),
+        mt_transforms.ToTensor(),
+        mt_transforms.Normalize([source_train_mean], [source_train_std]),
     ])
 
-    target_transform = tv.transforms.Compose([
-        mt_transform.CenterCrop2D((200, 200)),
-        mt_transform.AdditiveGaussianNoise(0.0, aug_gaussian_noise),
-        mt_transform.ToTensor(),
-        mt_transform.Normalize([target_train_mean], [target_train_std]),
+    # Target adaptation data augmentation
+    target_adapt_transform = tv.transforms.Compose([
+        mt_transforms.CenterCrop2D((200, 200), labeled=False),
+        mt_transforms.ToTensor(),
+        mt_transforms.Normalize([target_adapt_train_mean], [target_adapt_train_std]),
     ])
 
-    target_student_transform = tv.transforms.Compose([
-        mt_transform.ToPIL(),
-        mt_transform.RandomRotation(aug_rotation_range),
-        mt_transform.ToTensor(),
+    # Target adaptation data augmentation
+    target_val_adapt_transform = tv.transforms.Compose([
+        mt_transforms.CenterCrop2D((200, 200)),
+        mt_transforms.ToTensor(),
+        mt_transforms.Normalize([target_adapt_train_mean], [target_adapt_train_std]),
     ])
 
-    # TODO now identity, keeping it here for future (maybe link parameters for both transforms)
-    target_teacher_transform = tv.transforms.Compose([
-        mt_transform.ToPIL(),
-        mt_transform.ToTensor(),
-    ])
+    source_train.set_transform(source_transform)
+    target_adapt_train.set_transform(target_adapt_transform)
+    target_validation.set_transform(target_val_adapt_transform)
 
-    # TODO add setter to transform
-    source_train.transform = source_val.transform = source_transform
-    # TODO validation shouldn't be the same transforms, keeping due to centercrop
-    target_train.transform = target_val.transform = target_transform
+    source_train_loader = DataLoader(source_train, batch_size=ctx["source_batch_size"],
+                                     shuffle=True, drop_last=True,
+                                     num_workers=num_workers,
+                                     collate_fn=mt_datasets.mt_collate,
+                                     pin_memory=True)
 
-    source_train_loader = create_loader(ctx, source_train)
-    target_train_loader = create_loader(ctx, target_train, source=False)
-    source_val_loader = create_loader(ctx, source_val)
-    target_val_loader = create_loader(ctx, target_val, source=False)
+    target_adapt_train_loader = DataLoader(target_adapt_train, batch_size=ctx["target_batch_size"],
+                                           shuffle=True, drop_last=True,
+                                           num_workers=num_workers,
+                                           collate_fn=mt_datasets.mt_collate,
+                                           pin_memory=True)
+
+    target_validation_loader = DataLoader(target_validation, batch_size=ctx["target_batch_size"],
+                                          shuffle=False, drop_last=False,
+                                          num_workers=num_workers,
+                                          collate_fn=mt_datasets.mt_collate,
+                                          pin_memory=True)
 
     model = create_model(ctx)
-    model_ema = create_model(ctx, ema=True)
+
+    if not supervised_only:
+        model_ema = create_model(ctx, ema=True)
+    else:
+        model_ema = None
 
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=initial_lr,
@@ -288,7 +349,8 @@ def cmd_train(ctx):
 
     writer = SummaryWriter(log_dir="log_{}".format(experiment_name))
 
-    for epoch in tqdm(range(1, num_epochs+1), desc="Epochs"):
+    # Training loop
+    for epoch in tqdm(range(1, num_epochs + 1), desc="Epochs"):
         start_time = time.time()
 
         # Rampup -----
@@ -315,139 +377,274 @@ def cmd_train(ctx):
 
         # Train mode
         model.train()
-        model_ema.train()
 
-        task_loss_total = 0.0
+        if not supervised_only:
+            model_ema.train()
+
+        composite_loss_total = 0.0
+        class_loss_total = 0.0
         consistency_loss_total = 0.0
-        loss_total = 0.0
 
-        target_train_iter = iter(target_train_loader)
         num_steps = 0
-        for i, source_input in enumerate(source_train_loader): #TODO presumes first_set > second_set
-            try:
-                target_input = target_train_iter.next()
-            except:
-                target_train_iter = iter(target_train_loader)
-                target_input = target_train_iter.next()
+        target_adapt_train_iter = iter(target_adapt_train_loader)
 
-            # Apply transforms on target student samples
-            student_dict_list = []
-            for sample in mt_dataset.BatchSplit(target_input):
-                sample_student = sample.copy()
-                student_dict_list.append(target_student_transform(sample_student))
+        for i, train_batch in enumerate(source_train_loader):
+            # Keys: 'input', 'gt', 'input_metadata', 'gt_metadata'
 
-            student_samples = [torch.unsqueeze(sample['input'], 0) for sample in student_dict_list]
-            student_samples = torch.cat(student_samples, 0)
-            student_samples = torch.autograd.Variable(student_samples).cuda()
+            # Supervised component --------------------------------------------
+            train_input, train_gt = train_batch["input"], train_batch["gt"]
+            train_input = train_input.cuda()
+            train_gt = train_gt.cuda(async=True)
+            preds_supervised = model(train_input)
+            class_loss = mt_losses.dice_loss(preds_supervised, train_gt)
 
-            s_image, s_gt = source_input["input"], source_input["gt"]
-            s_var_image = torch.autograd.Variable(s_image).cuda()
-            s_var_gt = torch.autograd.Variable(s_gt).cuda(async=True)
+            if not supervised_only:
 
-            # Inference for source and target on student
-            student_source_out = model(s_var_image)
-            student_target_out = model(student_samples)
+                # Unsupervised component ------------------------------------------
+                try:
+                    target_adapt_batch = target_adapt_train_iter.next()
+                except StopIteration:
+                    target_adapt_train_iter = iter(target_adapt_train_loader)
+                    target_adapt_batch = target_adapt_train_iter.next()
 
-            # Inference for target on non transformed images
-            t_image = target_input["input"]
-            t_var_image = torch.autograd.Variable(t_image).cuda()
-            teacher_target_out = model_ema(t_var_image)
-            teacher_samples = []
-            for teacher_out, student_sample in zip(teacher_target_out, student_dict_list):
-                metadata = student_sample['input_metadata']
-                teacher_samples.append(torch.tensor(random_rotation(teacher_out.cpu().numpy(), metadata["__rotation"])))
-                # teacher_samples.append(target_teacher_transform(sample_teacher)['input']) #TODO use more MT
+                target_adapt_input = target_adapt_batch["input"]
+                target_adapt_input = target_adapt_input.cuda()
 
-            for i, t in enumerate(teacher_samples):
-                teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
-            teacher_samples = torch.cat(teacher_samples, 0)
-            teacher_target_out_nograd = torch.autograd.Variable(teacher_samples,
-                                                                requires_grad=False).cuda()
+                # Student forward
+                preds_unsup = model(target_adapt_input)
 
-            task_loss = dice_loss(student_source_out, s_var_gt)
-            task_loss_total += task_loss.item()
+                linked_aug_batch = \
+                    linked_batch_augmentation(target_adapt_input, preds_unsup)
 
-            consistency_loss = F.binary_cross_entropy(student_target_out,
-                                                      teacher_target_out_nograd)
-            consistency_loss_total += consistency_loss.item()
-            consistency_loss = (consistency_weight * consistency_loss) / ctx["target_batch_size"]
+                adapt_input_batch = linked_aug_batch['input'][0].cuda()
+                preds_unsup_aug = linked_aug_batch['input'][1].cuda()
 
+                # Teacher forward
+                with torch.no_grad():
+                    teacher_preds_unsup = model_ema(adapt_input_batch)
 
-            loss = task_loss + consistency_loss
-            loss_total += loss.item()
+                consistency_loss = consistency_weight * F.binary_cross_entropy(teacher_preds_unsup,
+                                                                               preds_unsup_aug)
+            else:
+                consistency_loss = torch.FloatTensor([0.]).cuda()
+
+            composite_loss = class_loss + consistency_loss
+
             optimizer.zero_grad()
-            loss.backward()
-            if ctx["clip_norm"]:
-                norm = nn.utils.clip_grad_norm(model.parameters(), ctx["clip_norm_value"])
+            composite_loss.backward()
 
             optimizer.step()
+
+            composite_loss_total += composite_loss.item()
+            consistency_loss_total += consistency_loss.item()
+            class_loss_total += class_loss.item()
 
             num_steps += 1
             global_step += 1
 
-            if epoch <= initial_lr_rampup:
-                update_ema_variables(model, model_ema, ctx["ema_alpha"], global_step)
-            else:
-                update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
+            if not supervised_only:
+                if epoch <= initial_lr_rampup:
+                    update_ema_variables(model, model_ema, ctx["ema_alpha"], global_step)
+                else:
+                    update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
 
-        loss_avg = loss_total / num_steps
-        task_loss_avg = task_loss_total / num_steps
+        composite_loss_avg = composite_loss_total / num_steps
+        class_loss_avg = class_loss_total / num_steps
         consistency_loss_avg = consistency_loss_total / num_steps
 
         tqdm.write("Steps p/ Epoch: {}".format(num_steps))
         tqdm.write("Consistency Weight: {:.6f}".format(consistency_weight))
-        tqdm.write("Composite Loss: {:.6f}".format(loss_avg))
-        tqdm.write("Task Loss: {:.6f}".format(task_loss_avg))
+        tqdm.write("Composite Loss: {:.6f}".format(composite_loss_avg))
+        tqdm.write("Class Loss: {:.6f}".format(class_loss_avg))
         tqdm.write("Consistency Loss: {:.6f}".format(consistency_loss_avg))
 
         # Write sample images
         if ctx["write_images"] and epoch % ctx["write_images_interval"] == 0:
             try:
-                plot_img = vutils.make_grid(student_source_out.data,
+                plot_img = vutils.make_grid(preds_supervised,
                                             normalize=True, scale_each=True)
-                writer.add_image('Model Source Prediction', plot_img, epoch)
-                plot_img = vutils.make_grid(s_var_image.data,
-                                            normalize=True, scale_each=True)
-                writer.add_image('Model Source Input', plot_img, epoch)
-                plot_img = vutils.make_grid(student_target_out.data,
-                                            normalize=True, scale_each=True)
-                writer.add_image('Model Target Prediction', plot_img, epoch)
-                plot_img = vutils.make_grid(t_var_image.data,
-                                            normalize=True, scale_each=True)
-                writer.add_image('Model Target Input', plot_img, epoch)
+                writer.add_image('Train Source Prediction', plot_img, epoch)
 
+                plot_img = vutils.make_grid(train_input,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Train Source Input', plot_img, epoch)
 
+                plot_img = vutils.make_grid(train_gt,
+                                            normalize=True, scale_each=True)
+                writer.add_image('Train Source Ground Truth', plot_img, epoch)
+
+                # Unsupervised component viz
+                if not supervised_only:
+                    plot_img = vutils.make_grid(target_adapt_input,
+                                                normalize=True, scale_each=True)
+                    writer.add_image('Train Target Student Input', plot_img, epoch)
+
+                    plot_img = vutils.make_grid(preds_unsup,
+                                                normalize=True, scale_each=True)
+                    writer.add_image('Train Target Student Preds', plot_img, epoch)
+
+                    plot_img = vutils.make_grid(adapt_input_batch,
+                                                normalize=True, scale_each=True)
+                    writer.add_image('Train Target Teacher Input', plot_img, epoch)
+
+                    plot_img = vutils.make_grid(teacher_preds_unsup,
+                                                normalize=True, scale_each=True)
+                    writer.add_image('Train Target Teacher Preds', plot_img, epoch)
+
+                    plot_img = vutils.make_grid(teacher_preds_unsup,
+                                                normalize=True, scale_each=True)
+                    writer.add_image('Train Target Student Preds (augmented)', plot_img, epoch)
             except:
                 tqdm.write("*** Error writing images ***")
 
-        writer.add_scalars('losses', {'composite_loss': loss_avg,
-                           'task_loss': task_loss_avg,
-                           'consistency_loss': consistency_loss_avg},
+        writer.add_scalars('losses', {'composite_loss': composite_loss_avg,
+                                      'class_loss': class_loss_avg,
+                                      'consistency_loss': consistency_loss_avg},
                            epoch)
-
-        # Evaluation ####################################################################
 
         # Evaluation mode
         model.eval()
-        model_ema.eval()
 
-        metric_fns = [metrics.dice_score, metrics.jaccard_score, metrics.hausdorff_score,
-                      metrics.precision_score, metrics.recall_score,
-                      metrics.specificity_score, metrics.intersection_over_union,
-                      metrics.accuracy_score]
+        if not supervised_only:
+            model_ema.eval()
+
+        metric_fns = [mt_metrics.dice_score, mt_metrics.jaccard_score, mt_metrics.hausdorff_score,
+                      mt_metrics.precision_score, mt_metrics.recall_score,
+                      mt_metrics.specificity_score, mt_metrics.intersection_over_union,
+                      mt_metrics.accuracy_score]
 
         validation(model, model_ema,
-                   source_val_loader,
+                   target_validation_loader,
                    writer, metric_fns,
-                   epoch, 'source_val')
-        validation(model, model_ema,
-                   target_val_loader,
-                   writer, metric_fns,
-                   epoch, 'target_val')
+                   epoch, ctx, 'target_val')
 
         end_time = time.time()
         total_time = end_time - start_time
         tqdm.write("Epoch {} took {:.2f} seconds.".format(epoch, total_time))
+
+        # target_train_iter = iter(target_train_loader)
+        # num_steps = 0
+        # for i, source_input in enumerate(source_train_loader): #TODO presumes first_set > second_set
+        #     try:
+        #         target_input = target_train_iter.next()
+        #     except:
+        #         target_train_iter = iter(target_train_loader)
+        #         target_input = target_train_iter.next()
+        #
+        #     # Apply transforms on target student samples
+        #     student_dict_list = []
+        #     for sample in mt_dataset.BatchSplit(target_input):
+        #         sample_student = sample.copy()
+        #         student_dict_list.append(target_student_transform(sample_student))
+        #
+        #     student_samples = [torch.unsqueeze(sample['input'], 0) for sample in student_dict_list]
+        #     student_samples = torch.cat(student_samples, 0)
+        #     student_samples = torch.autograd.Variable(student_samples).cuda()
+        #
+        #     s_image, s_gt = source_input["input"], source_input["gt"]
+        #     s_var_image = torch.autograd.Variable(s_image).cuda()
+        #     s_var_gt = torch.autograd.Variable(s_gt).cuda(async=True)
+        #
+        #     # Inference for source and target on student
+        #     student_source_out = model(s_var_image)
+        #     student_target_out = model(student_samples)
+        #
+        #     # Inference for target on non transformed images
+        #     t_image = target_input["input"]
+        #     t_var_image = torch.autograd.Variable(t_image).cuda()
+        #     teacher_target_out = model_ema(t_var_image)
+        #     teacher_samples = []
+        #     for teacher_out, student_sample in zip(teacher_target_out, student_dict_list):
+        #         metadata = student_sample['input_metadata']
+        #         teacher_samples.append(torch.tensor(random_rotation(teacher_out.cpu().numpy(), metadata["__rotation"])))
+        #         # teacher_samples.append(target_teacher_transform(sample_teacher)['input']) #TODO use more MT
+        #
+        #     for i, t in enumerate(teacher_samples):
+        #         teacher_samples[i] = torch.unsqueeze(teacher_samples[i], 0)
+        #     teacher_samples = torch.cat(teacher_samples, 0)
+        #     teacher_target_out_nograd = torch.autograd.Variable(teacher_samples,
+        #                                                         requires_grad=False).cuda()
+        #
+        #     task_loss = dice_loss(student_source_out, s_var_gt)
+        #     task_loss_total += task_loss.item()
+        #
+        #     consistency_loss = F.binary_cross_entropy(student_target_out,
+        #                                               teacher_target_out_nograd)
+        #     consistency_loss_total += consistency_loss.item()
+        #     consistency_loss = (consistency_weight * consistency_loss) / ctx["target_batch_size"]
+        #
+        #
+        #     loss = task_loss + consistency_loss
+        #     loss_total += loss.item()
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     if ctx["clip_norm"]:
+        #         norm = nn.utils.clip_grad_norm(model.parameters(), ctx["clip_norm_value"])
+        #
+        #     optimizer.step()
+        #
+        #     num_steps += 1
+        #     global_step += 1
+        #
+        #     if epoch <= initial_lr_rampup:
+        #         update_ema_variables(model, model_ema, ctx["ema_alpha"], global_step)
+        #     else:
+        #         update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
+        #
+        # loss_avg = loss_total / num_steps
+        # task_loss_avg = task_loss_total / num_steps
+        # consistency_loss_avg = consistency_loss_total / num_steps
+        #
+        # tqdm.write("Steps p/ Epoch: {}".format(num_steps))
+        # tqdm.write("Consistency Weight: {:.6f}".format(consistency_weight))
+        # tqdm.write("Composite Loss: {:.6f}".format(loss_avg))
+        # tqdm.write("Task Loss: {:.6f}".format(task_loss_avg))
+        # tqdm.write("Consistency Loss: {:.6f}".format(consistency_loss_avg))
+        #
+        # # Write sample images
+        # if ctx["write_images"] and epoch % ctx["write_images_interval"] == 0:
+        #     try:
+        #         plot_img = vutils.make_grid(student_source_out.data,
+        #                                     normalize=True, scale_each=True)
+        #         writer.add_image('Model Source Prediction', plot_img, epoch)
+        #         plot_img = vutils.make_grid(s_var_image.data,
+        #                                     normalize=True, scale_each=True)
+        #         writer.add_image('Model Source Input', plot_img, epoch)
+        #         plot_img = vutils.make_grid(student_target_out.data,
+        #                                     normalize=True, scale_each=True)
+        #         writer.add_image('Model Target Prediction', plot_img, epoch)
+        #         plot_img = vutils.make_grid(t_var_image.data,
+        #                                     normalize=True, scale_each=True)
+        #         writer.add_image('Model Target Input', plot_img, epoch)
+        #     except:
+        #         tqdm.write("*** Error writing images ***")
+        #
+        # writer.add_scalars('losses', {'composite_loss': loss_avg,
+        #                    'task_loss': task_loss_avg,
+        #                    'consistency_loss': consistency_loss_avg},
+        #                    epoch)
+        #
+        # # Evaluation ####################################################################
+        #
+        # # Evaluation mode
+        # model.eval()
+        # model_ema.eval()
+        #
+        # metric_fns = [metrics.dice_score, metrics.jaccard_score, metrics.hausdorff_score,
+        #               metrics.precision_score, metrics.recall_score,
+        #               metrics.specificity_score, metrics.intersection_over_union,
+        #               metrics.accuracy_score]
+        #
+        # validation(model, model_ema,
+        #            source_val_loader,
+        #            writer, metric_fns,
+        #            epoch, 'source_val')
+        # validation(model, model_ema,
+        #            target_val_loader,
+        #            writer, metric_fns,
+        #            epoch, 'target_val')
+
+
 
 
 def run_main():
