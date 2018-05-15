@@ -190,7 +190,7 @@ def validation(model, model_ema, loader, writer,
 
     writer.add_scalars(prefix + '_metrics', result_dict, epoch)
 
-
+    
 def linked_batch_augmentation(input_batch, preds_unsup):
 
     # Teach transformation
@@ -256,20 +256,20 @@ def cmd_train(ctx):
     # Sample Xs and Ys from this
     source_train = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
                                                     slice_filter_fn=mt_filters.SliceFilter(),
-                                                    site_ids=[1, 2],
+                                                    site_ids=[1, 2], # Test = 1,2,3, train = 1,2
                                                     subj_ids=range(1, 11))
 
     # Sample Xt1, Xt2 from this
     unlabeled_filter = mt_filters.SliceFilter(filter_empty_mask=False)
     target_adapt_train = mt_datasets.SCGMChallenge2DTest(rootdir_gmchallenge_test,
                                                          slice_filter_fn=unlabeled_filter,
-                                                         site_ids=[3],
+                                                         site_ids=[3], # 3 = train, 4 = test
                                                          subj_ids=range(11, 21))
 
     # Sample Xv, Yv from this
     target_validation = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
                                                          slice_filter_fn=mt_filters.SliceFilter(),
-                                                         site_ids=[3],
+                                                         site_ids=[3], # 3 = train, 4 = test
                                                          subj_ids=range(1, 11))
 
     source_train_mean, source_train_std = source_train.compute_mean_std(True)
@@ -304,6 +304,7 @@ def cmd_train(ctx):
     ])
 
     source_train.set_transform(source_transform)
+
     target_adapt_train.set_transform(target_adapt_transform)
     target_validation.set_transform(target_val_adapt_transform)
 
@@ -399,21 +400,20 @@ def cmd_train(ctx):
                 target_adapt_input = target_adapt_batch["input"]
                 target_adapt_input = target_adapt_input.cuda()
 
-                # Student forward
-                preds_unsup = model(target_adapt_input)
-
-                linked_aug_batch = \
-                    linked_batch_augmentation(target_adapt_input, preds_unsup)
-
-                adapt_input_batch = linked_aug_batch['input'][0].cuda()
-                preds_unsup_aug = linked_aug_batch['input'][1].cuda()
-
                 # Teacher forward
                 with torch.no_grad():
-                    teacher_preds_unsup = model_ema(adapt_input_batch)
+                    teacher_preds_unsup = model_ema(target_adapt_input)
 
-                consistency_loss = consistency_weight * F.binary_cross_entropy(teacher_preds_unsup,
-                                                                               preds_unsup_aug)
+                linked_aug_batch = \
+                    linked_batch_augmentation(target_adapt_input, teacher_preds_unsup)
+
+                adapt_input_batch = linked_aug_batch['input'][0].cuda()
+                teacher_preds_unsup_aug = linked_aug_batch['input'][1].cuda()
+
+                # Student forward
+                student_preds_unsup = model(adapt_input_batch)
+                consistency_loss = consistency_weight * F.mse_loss(student_preds_unsup,
+                                                                   teacher_preds_unsup_aug)
             else:
                 consistency_loss = torch.FloatTensor([0.]).cuda()
 
@@ -468,7 +468,7 @@ def cmd_train(ctx):
                                                 normalize=True, scale_each=True)
                     writer.add_image('Train Target Student Input', plot_img, epoch)
 
-                    plot_img = vutils.make_grid(preds_unsup,
+                    plot_img = vutils.make_grid(teacher_preds_unsup,
                                                 normalize=True, scale_each=True)
                     writer.add_image('Train Target Student Preds', plot_img, epoch)
 
@@ -476,11 +476,11 @@ def cmd_train(ctx):
                                                 normalize=True, scale_each=True)
                     writer.add_image('Train Target Teacher Input', plot_img, epoch)
 
-                    plot_img = vutils.make_grid(teacher_preds_unsup,
+                    plot_img = vutils.make_grid(student_preds_unsup,
                                                 normalize=True, scale_each=True)
                     writer.add_image('Train Target Teacher Preds', plot_img, epoch)
 
-                    plot_img = vutils.make_grid(teacher_preds_unsup,
+                    plot_img = vutils.make_grid(student_preds_unsup,
                                                 normalize=True, scale_each=True)
                     writer.add_image('Train Target Student Preds (augmented)', plot_img, epoch)
             except:
