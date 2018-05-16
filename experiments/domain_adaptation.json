@@ -1,6 +1,6 @@
 {
   "command": "train",
-  "experiment_name": "adaptation",
+  "experiment_name": "exp1_train_mse_c15_sm_ni_gn_lessaug",
   "rootdir_gmchallenge_train": "/home/chper_local/Devel/medicaltorch/data",
   "rootdir_gmchallenge_test": "/home/chper_local/Devel/medicaltorch/data_test",
   "num_epochs": 350,
@@ -11,7 +11,7 @@
   "initial_lr": 0.0006,
   "initial_lr_rampup": 50,
   "decay_lr": "cosine",
-  "cons_weight": 2.9,
+  "cons_weight": 1.5,
   "consistency_rampup": 100,
   "ema_alpha": 0.99,
   "ema_alpha_late": 0.999,
@@ -19,5 +19,5 @@
   "bn_momentum": 0.1,
   "weight_decay": 0.0006,
   "write_images": true,
-  "write_images_interval": 5
+  "write_images_interval": 10
 }
