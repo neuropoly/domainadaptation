@@ -23,6 +23,7 @@ import torchvision.utils as vutils
 from tqdm import *
 from tensorboardX import SummaryWriter
 
+import os
 
 def decay_poly_lr(current_epoch, num_epochs, initial_lr):
     initial_lrate = initial_lr
@@ -190,7 +191,7 @@ def validation(model, model_ema, loader, writer,
 
     writer.add_scalars(prefix + '_metrics', result_dict, epoch)
 
-    
+
 def linked_batch_augmentation(input_batch, preds_unsup):
 
     # Teach transformation
@@ -240,6 +241,9 @@ def cmd_train(ctx):
     rootdir_gmchallenge_test = ctx["rootdir_gmchallenge_test"]
     supervised_only = ctx["supervised_only"]
 
+    """
+    decay_lr
+    """
     if "constant" in ctx["decay_lr"]:
         decay_lr_fn = decay_constant_lr
 
@@ -249,6 +253,16 @@ def cmd_train(ctx):
     if "cosine" in ctx["decay_lr"]:
         decay_lr_fn = cosine_lr
 
+    """
+    consistency_loss
+    """
+    if "dice" in ctx["consistency_loss"]:
+        consistency_loss_fn = mt_losses.dice_loss
+    if "mse" in ctx["consistency_loss"]:
+        consistency_loss_fn = F.mse_loss
+    if "cross_entropy" in ctx["consistency_loss"]:
+        consistency_loss_fn = F.binary_cross_entropy
+
     # Xs, Ys = Source input and source label, train
     # Xt1, Xt2 = Target, domain adaptation, no label, different aug (same sample), train
     # Xv, Yv = Target input and target label, validation
@@ -256,21 +270,24 @@ def cmd_train(ctx):
     # Sample Xs and Ys from this
     source_train = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
                                                     slice_filter_fn=mt_filters.SliceFilter(),
-                                                    site_ids=[1, 2], # Test = 1,2,3, train = 1,2
+                                                    site_ids=ctx["source_centers"], # Test = 1,2,3, train = 1,2
                                                     subj_ids=range(1, 11))
 
     # Sample Xt1, Xt2 from this
     unlabeled_filter = mt_filters.SliceFilter(filter_empty_mask=False)
     target_adapt_train = mt_datasets.SCGMChallenge2DTest(rootdir_gmchallenge_test,
                                                          slice_filter_fn=unlabeled_filter,
-                                                         site_ids=[3], # 3 = train, 4 = test
+                                                         site_ids=ctx["adapt_centers"], # 3 = train, 4 = test
                                                          subj_ids=range(11, 21))
 
+
     # Sample Xv, Yv from this
-    target_validation = mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
-                                                         slice_filter_fn=mt_filters.SliceFilter(),
-                                                         site_ids=[3], # 3 = train, 4 = test
-                                                         subj_ids=range(1, 11))
+    validation_centers = []
+    for center in ctx["val_centers"]:
+        validation_centers.append(mt_datasets.SCGMChallenge2DTrain(rootdir_gmchallenge_train,
+                                                             slice_filter_fn=mt_filters.SliceFilter(),
+                                                             site_ids=[center], # 3 = train, 4 = test
+                                                             subj_ids=range(1, 11)))
 
     source_train_mean, source_train_std = source_train.compute_mean_std(True)
     target_adapt_train_mean, target_adapt_train_std = target_adapt_train.compute_mean_std(True)
@@ -306,7 +323,8 @@ def cmd_train(ctx):
     source_train.set_transform(source_transform)
 
     target_adapt_train.set_transform(target_adapt_transform)
-    target_validation.set_transform(target_val_adapt_transform)
+    for center in validation_centers:
+        center.set_transform(target_val_adapt_transform)
 
     source_train_loader = DataLoader(source_train, batch_size=ctx["source_batch_size"],
                                      shuffle=True, drop_last=True,
@@ -320,11 +338,13 @@ def cmd_train(ctx):
                                            collate_fn=mt_datasets.mt_collate,
                                            pin_memory=True)
 
-    target_validation_loader = DataLoader(target_validation, batch_size=ctx["target_batch_size"],
-                                          shuffle=False, drop_last=False,
-                                          num_workers=num_workers,
-                                          collate_fn=mt_datasets.mt_collate,
-                                          pin_memory=True)
+    validation_centers_loaders = []
+    for center in validation_centers:
+        validation_centers_loaders.append(DataLoader(center, batch_size=ctx["target_batch_size"],
+                                                     shuffle=False, drop_last=False,
+                                                     num_workers=num_workers,
+                                                     collate_fn=mt_datasets.mt_collate,
+                                                     pin_memory=True))
 
     model = create_model(ctx)
 
@@ -412,8 +432,8 @@ def cmd_train(ctx):
 
                 # Student forward
                 student_preds_unsup = model(adapt_input_batch)
-                consistency_loss = consistency_weight * F.mse_loss(student_preds_unsup,
-                                                                   teacher_preds_unsup_aug)
+                consistency_loss = consistency_weight * consistency_loss_fn(student_preds_unsup,
+                                                                            teacher_preds_unsup_aug)
             else:
                 consistency_loss = torch.FloatTensor([0.]).cuda()
 
@@ -432,7 +452,7 @@ def cmd_train(ctx):
             global_step += 1
 
             if not supervised_only:
-                if epoch <= initial_lr_rampup:
+                if epoch <= ctx["ema_late_epoch"]:
                     update_ema_variables(model, model_ema, ctx["ema_alpha"], global_step)
                 else:
                     update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
@@ -502,10 +522,10 @@ def cmd_train(ctx):
                       mt_metrics.specificity_score, mt_metrics.intersection_over_union,
                       mt_metrics.accuracy_score]
 
-        validation(model, model_ema,
-                   target_validation_loader,
-                   writer, metric_fns,
-                   epoch, ctx, 'target_val')
+        for center, loader in enumerate(validation_centers_loaders):
+            validation(model, model_ema,
+                       loader, writer, metric_fns,
+                       epoch, ctx, 'val_%s' % ctx["val_centers"][center])
 
         end_time = time.time()
         total_time = end_time - start_time
@@ -525,6 +545,7 @@ def run_main():
         return
 
     command = ctx["command"]
+    os.environ["CUDA_VISIBLE_DEVICES"]=str(ctx["gpu"])
 
     if command == 'train':
         cmd_train(ctx)
