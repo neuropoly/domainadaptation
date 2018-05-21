@@ -241,6 +241,15 @@ def cmd_train(ctx):
     rootdir_gmchallenge_test = ctx["rootdir_gmchallenge_test"]
     supervised_only = ctx["supervised_only"]
 
+
+    """
+    experiment_name
+    """
+    experiment_name += '-e%s-cw%s-lr%s-cr%s-lramp%s-wd%s-cl%s-sc%s-ac%s-vc%s' % \
+                        (num_epochs, cons_weight, initial_lr, consistency_rampup,
+                        ctx["initial_lr_rampup"], weight_decay, ctx["consistency_loss"],
+                        ctx["source_centers"], ctx["adapt_centers"], ctx["val_centers"])
+
     """
     decay_lr
     """
@@ -532,20 +541,24 @@ def cmd_train(ctx):
         tqdm.write("Epoch {} took {:.2f} seconds.".format(epoch, total_time))
 
 
-def run_main():
-    if len(sys.argv) <= 1:
+def run_main(json_ctx=None):
+    if not json_ctx and len(sys.argv) <= 1:
         print("\ndomainadapt [config filename].json\n")
         return
 
-    try:
-        with open(sys.argv[1], "r") as fhandle:
-            ctx = json.load(fhandle)
-    except FileNotFoundError:
-        print("\nFile {} not found !\n".format(sys.argv[1]))
-        return
+    elif json_ctx:
+        ctx = json_ctx
+    else:
+        try:
+            with open(sys.argv[1], "r") as fhandle:
+                ctx = json.load(fhandle)
+        except FileNotFoundError:
+            print("\nFile {} not found !\n".format(sys.argv[1]))
+            return
 
     command = ctx["command"]
-    os.environ["CUDA_VISIBLE_DEVICES"]=str(ctx["gpu"])
+    # os.environ["CUDA_VISIBLE_DEVICES"]=str(ctx["gpu"])
+    torch.cuda.set_device(int(ctx["gpu"]))
 
     if command == 'train':
         cmd_train(ctx)

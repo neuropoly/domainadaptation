@@ -1,9 +1,9 @@
 {
   "command": "train",
-  "experiment_name": "exp1_train_mse_c15_sm_ni_gn_lessaug",
+  "experiment_name": "adapted",
   "rootdir_gmchallenge_train": "/A/ballester/datasets/scgm/training_resample",
   "rootdir_gmchallenge_test": "/A/ballester/datasets/scgm/test_resample",
-  "gpu": "0",
+  "gpu": "2",
   "num_epochs": 350,
   "source_batch_size": 12,
   "target_batch_size": 12,
