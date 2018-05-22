@@ -21,6 +21,8 @@ import torchvision as tv
 import torchvision.utils as vutils
 
 from tqdm import *
+monitor_interval = 0
+
 from tensorboardX import SummaryWriter
 
 import os
@@ -241,14 +243,13 @@ def cmd_train(ctx):
     rootdir_gmchallenge_test = ctx["rootdir_gmchallenge_test"]
     supervised_only = ctx["supervised_only"]
 
-
     """
     experiment_name
     """
-    experiment_name += '-e%s-cw%s-lr%s-cr%s-lramp%s-wd%s-cl%s-sc%s-ac%s-vc%s' % \
-                        (num_epochs, cons_weight, initial_lr, consistency_rampup,
-                        ctx["initial_lr_rampup"], weight_decay, ctx["consistency_loss"],
-                        ctx["source_centers"], ctx["adapt_centers"], ctx["val_centers"])
+    # experiment_name += '-e%s-cw%s-lr%s-cr%s-lramp%s-wd%s-cl%s-sc%s-ac%s-vc%s' % \
+    #                     (num_epochs, cons_weight, initial_lr, consistency_rampup,
+    #                     ctx["initial_lr_rampup"], weight_decay, ctx["consistency_loss"],
+    #                     ctx["source_centers"], ctx["adapt_centers"], ctx["val_centers"])
 
     """
     decay_lr
