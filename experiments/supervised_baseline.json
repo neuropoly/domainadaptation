@@ -13,6 +13,7 @@
   "initial_lr_rampup": 50,
   "decay_lr": "cosine",
   "consistency_loss": "mse",
+  "confidence_threshold": 0.9,
   "cons_weight": 1.5,
   "consistency_rampup": 100,
   "ema_alpha": 0.99,

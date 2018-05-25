@@ -1,9 +1,11 @@
 import sys
 import json
 import time
-import numpy as np
+import os
 from collections import defaultdict
 import itertools
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -21,11 +23,9 @@ import torchvision as tv
 import torchvision.utils as vutils
 
 from tqdm import *
-monitor_interval = 0
 
 from tensorboardX import SummaryWriter
 
-import os
 
 def decay_poly_lr(current_epoch, num_epochs, initial_lr):
     initial_lrate = initial_lr
@@ -49,7 +49,7 @@ def decay_constant_lr(current_epoch, num_epochs, initial_lr):
 
 
 def get_current_consistency_weight(weight, epoch, rampup):
-    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    """Consistency ramp-up from https://arxiv.org/abs/1610.02242"""
     return weight * sigmoid_rampup(epoch, rampup)
 
 
@@ -251,9 +251,7 @@ def cmd_train(ctx):
     #                     ctx["initial_lr_rampup"], weight_decay, ctx["consistency_loss"],
     #                     ctx["source_centers"], ctx["adapt_centers"], ctx["val_centers"])
 
-    """
-    decay_lr
-    """
+    # Decay for learning rate
     if "constant" in ctx["decay_lr"]:
         decay_lr_fn = decay_constant_lr
 
@@ -263,15 +261,22 @@ def cmd_train(ctx):
     if "cosine" in ctx["decay_lr"]:
         decay_lr_fn = cosine_lr
 
-    """
-    consistency_loss
-    """
-    if "dice" in ctx["consistency_loss"]:
+    # Consistency loss
+    #
+    # mse = Mean Squared Error
+    # dice = Dice loss
+    # cross_entropy = Cross Entropy
+    # mse_confidence = MSE with Confidence Threshold
+    if ctx["consistency_loss"] == "dice":
         consistency_loss_fn = mt_losses.dice_loss
-    if "mse" in ctx["consistency_loss"]:
+    if ctx["consistency_loss"] == "mse":
         consistency_loss_fn = F.mse_loss
-    if "cross_entropy" in ctx["consistency_loss"]:
+    if ctx["consistency_loss"] == "cross_entropy":
         consistency_loss_fn = F.binary_cross_entropy
+    if ctx["consistency_loss"] == "mse_confident":
+        confidence_threshold = ctx["confidence_threshold"]
+        consistency_loss_fn = mt_losses.ConfidentMSELoss(confidence_threshold)
+
 
     # Xs, Ys = Source input and source label, train
     # Xt1, Xt2 = Target, domain adaptation, no label, different aug (same sample), train
@@ -442,6 +447,7 @@ def cmd_train(ctx):
 
                 # Student forward
                 student_preds_unsup = model(adapt_input_batch)
+
                 consistency_loss = consistency_weight * consistency_loss_fn(student_preds_unsup,
                                                                             teacher_preds_unsup_aug)
             else:
