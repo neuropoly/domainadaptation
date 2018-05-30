@@ -24,7 +24,7 @@ for e in events:
     event.Reload()
 
     # Metric name is in the path, not in the eventfile
-    metric_name = e.rsplit('/', 2)[1]
+    metric_name = '/'.join(e.rsplit('/', 2)[0:2])
     scalars = event.Tags()['scalars']
     for scalar in scalars:
         if scalar in exceptions:
