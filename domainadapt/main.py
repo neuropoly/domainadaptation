@@ -14,10 +14,11 @@ from torch.nn import functional as F
 
 import medicaltorch.filters as mt_filters
 import medicaltorch.losses as mt_losses
-import medicaltorch.models as mt_models
 import medicaltorch.metrics as mt_metrics
 import medicaltorch.datasets as mt_datasets
 import medicaltorch.transforms as mt_transforms
+
+from domainadapt import models as da_models
 
 import torchvision as tv
 import torchvision.utils as vutils
@@ -103,7 +104,7 @@ def threshold_predictions(predictions, thr=0.999):
 def create_model(ctx, ema=False):
     drop_rate = ctx["drop_rate"]
     bn_momentum = ctx["bn_momentum"]
-    model = mt_models.Unet(drop_rate=drop_rate,
+    model = da_models.Unet(drop_rate=drop_rate,
                            bn_momentum=bn_momentum)
 
     if ema:
@@ -304,9 +305,6 @@ def cmd_train(ctx):
                                                              site_ids=[center], # 3 = train, 4 = test
                                                              subj_ids=range(1, 11)))
 
-    source_train_mean, source_train_std = source_train.compute_mean_std(True)
-    target_adapt_train_mean, target_adapt_train_std = target_adapt_train.compute_mean_std(True)
-
     # Training source data augmentation
     source_transform = tv.transforms.Compose([
         mt_transforms.CenterCrop2D((200, 200)),
@@ -318,21 +316,21 @@ def cmd_train(ctx):
                                    translate=(0.03, 0.03)),
         mt_transforms.RandomTensorChannelShift((-0.10, 0.10)),
         mt_transforms.ToTensor(),
-        mt_transforms.Normalize([source_train_mean], [source_train_std]),
+        mt_transforms.NormalizeInstance(),
     ])
 
     # Target adaptation data augmentation
     target_adapt_transform = tv.transforms.Compose([
         mt_transforms.CenterCrop2D((200, 200), labeled=False),
         mt_transforms.ToTensor(),
-        mt_transforms.Normalize([target_adapt_train_mean], [target_adapt_train_std]),
+        mt_transforms.NormalizeInstance(),
     ])
 
     # Target adaptation data augmentation
     target_val_adapt_transform = tv.transforms.Compose([
         mt_transforms.CenterCrop2D((200, 200)),
         mt_transforms.ToTensor(),
-        mt_transforms.Normalize([target_adapt_train_mean], [target_adapt_train_std]),
+        mt_transforms.NormalizeInstance(),
     ])
 
     source_train.set_transform(source_transform)
