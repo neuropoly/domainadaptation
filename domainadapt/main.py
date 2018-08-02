@@ -92,7 +92,7 @@ def update_ema_variables(model, ema_model, alpha, global_step):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
 
-def threshold_predictions(predictions, thr=0.999):
+def threshold_predictions(predictions, thr=0.9):
     thresholded_preds = predictions[:]
     low_values_indices = thresholded_preds < thr
     thresholded_preds[low_values_indices] = 0
