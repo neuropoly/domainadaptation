@@ -471,6 +471,17 @@ def cmd_train(ctx):
                 else:
                     update_ema_variables(model, model_ema, ctx["ema_alpha_late"], global_step)
 
+        # Write histogram of the probs
+        if not supervised_only:
+            npy_teacher_preds = teacher_preds_unsup.detach().cpu().numpy()
+            writer.add_histogram("Teacher Preds Hist", npy_teacher_preds, epoch)
+
+            npy_student_preds = student_preds_unsup.detach().cpu().numpy()
+            writer.add_histogram("Student Preds Hist", npy_student_preds, epoch)
+
+        npy_supervised_preds = preds_supervised.detach().cpu().numpy()
+        writer.add_histogram("Supervised Preds Hist", npy_supervised_preds, epoch)
+
         composite_loss_avg = composite_loss_total / num_steps
         class_loss_avg = class_loss_total / num_steps
         consistency_loss_avg = consistency_loss_total / num_steps
