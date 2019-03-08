@@ -7,6 +7,7 @@ Requirements for this project:
 
 * (required) Python 3.6 (use a virtual environment);
 * (required) [Spinal Cord Toolbox](https://github.com/neuropoly/spinalcordtoolbox)(SCT)
+* (required) [medicaltorch](https://github.com/perone/medicaltorch)
 * (optional) FSLeyes/FSLview/FSLutils
 
 These requirements are not included in the `setup.py` requirements, since
